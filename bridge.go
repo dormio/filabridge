@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -791,16 +792,53 @@ func (b *FilamentBridge) SetToolheadMapping(printerName string, toolheadID int, 
 
 	log.Printf("Mapped %s toolhead %d to spool %d", printerName, toolheadID, spoolID)
 
+	// Unlock the mutex after successful database operation, before HTTP calls to prevent deadlocks
+	b.mutex.Unlock()
+	
+	// Sync the toolhead assignment to Spoolman (after successful database update, before auto-assignment)
+	// Get display name for location formatting - handle both display names and internal IDs
+	printerConfigs, err := b.GetAllPrinterConfigs()
+	var displayName string
+	var resolvedPrinterName string
+	if err == nil {
+		for printerID, printerConfig := range printerConfigs {
+			// Check both display name and internal ID
+			if printerConfig.Name == printerName || printerID == printerName {
+				name, err := b.GetToolheadName(printerID, toolheadID)
+				if err == nil {
+					displayName = name
+				} else {
+					displayName = fmt.Sprintf("Toolhead %d", toolheadID)
+				}
+				// Use the display name for the location (not the internal ID)
+				resolvedPrinterName = printerConfig.Name
+				break
+			}
+		}
+	}
+	if displayName == "" {
+		displayName = fmt.Sprintf("Toolhead %d", toolheadID)
+		resolvedPrinterName = printerName // fallback to original name
+	}
+
+	// Update Spoolman location (non-fatal if it fails) - use resolved printer name
+	locationName := fmt.Sprintf("%s - %s", resolvedPrinterName, displayName)
+	log.Printf("Attempting to update spool %d to location '%s' in Spoolman (printer='%s', resolved='%s', toolhead=%d)", 
+		spoolID, locationName, printerName, resolvedPrinterName, toolheadID)
+	
+	if err := b.spoolman.UpdateSpoolLocation(spoolID, locationName); err != nil {
+		log.Printf("Warning: Failed to update Spoolman location for spool %d to '%s': %v", spoolID, locationName, err)
+		log.Printf("Spoolman sync failed but toolhead assignment in FilaBridge was successful")
+	} else {
+		log.Printf("Successfully updated spool %d to location '%s' in Spoolman", spoolID, locationName)
+	}
+
 	// Check if auto-assign feature is enabled and we have a previous spool to assign
 	enabled, err := b.GetAutoAssignPreviousSpoolEnabled()
 	if err != nil {
 		log.Printf("Warning: Failed to check auto-assign previous spool setting: %v", err)
-		b.mutex.Unlock()
 		return nil // Don't fail the assignment if we can't check the setting
 	}
-
-	// Unlock before potentially calling AssignSpoolToLocation (which may need locks)
-	b.mutex.Unlock()
 
 	if enabled && previousSpoolID > 0 && previousSpoolID != spoolID {
 		// Get the configured default location
@@ -830,6 +868,160 @@ func (b *FilamentBridge) SetToolheadMapping(printerName string, toolheadID int, 
 	}
 
 	return nil
+}
+
+// ParseToolheadLocationName parses a Spoolman location name to extract printer and toolhead information
+// Supports formats like "Toolhead 0", "PrinterName - Toolhead 0", "Pracovna - Black" (custom toolhead names)
+// Returns: printerName, toolheadID, customName, isToolheadLocation
+func (b *FilamentBridge) ParseToolheadLocationName(locationName string) (string, int, string, bool) {
+	if locationName == "" {
+		return "", -1, "", false
+	}
+
+	// Handle simple format: "Toolhead X"
+	if strings.HasPrefix(locationName, "Toolhead ") {
+		toolheadStr := strings.TrimPrefix(locationName, "Toolhead ")
+		if toolheadID, err := strconv.Atoi(toolheadStr); err == nil {
+			return "", toolheadID, "", true
+		}
+	}
+
+	// Handle qualified format: "PrinterName - Something"
+	if strings.Contains(locationName, " - ") {
+		parts := strings.SplitN(locationName, " - ", 2)
+		if len(parts) != 2 {
+			return "", -1, "", false
+		}
+
+		printerName := strings.TrimSpace(parts[0])
+		rightPart := strings.TrimSpace(parts[1])
+
+		// Check if it's "PrinterName - Toolhead X"
+		if strings.HasPrefix(rightPart, "Toolhead ") {
+			toolheadStr := strings.TrimPrefix(rightPart, "Toolhead ")
+			if toolheadID, err := strconv.Atoi(toolheadStr); err == nil {
+				return printerName, toolheadID, "", true
+			}
+		}
+
+		// Check if it's a custom toolhead name by looking up printer configs
+		printerConfigs, err := b.GetAllPrinterConfigs()
+		if err == nil {
+			// Try to match by display name or internal ID
+			for printerID, printerConfig := range printerConfigs {
+				if printerConfig.Name == printerName || printerID == printerName {
+					// Check if rightPart matches any custom toolhead name
+					for toolheadID := 0; toolheadID < printerConfig.Toolheads; toolheadID++ {
+						toolheadName, err := b.GetToolheadName(printerID, toolheadID)
+						if err == nil && toolheadName == rightPart {
+							return printerConfig.Name, toolheadID, rightPart, true
+						}
+					}
+					break
+				}
+			}
+		}
+
+		// If not a toolhead, might be a storage location with printer context
+		return printerName, -1, rightPart, false
+	}
+
+	// Not a recognized toolhead location format
+	return "", -1, locationName, false
+}
+
+// MonitorSpoolmanLocationChanges monitors Spoolman for location changes and syncs them to FilaBridge
+// This enables bidirectional sync when users move spools to toolhead locations in Spoolman
+func (b *FilamentBridge) MonitorSpoolmanLocationChanges() {
+	// Get all spools from Spoolman
+	spools, err := b.spoolman.GetAllSpools()
+	if err != nil {
+		log.Printf("Warning: Failed to get spools from Spoolman for location monitoring: %v", err)
+		return
+	}
+
+	// Get current FilaBridge toolhead mappings for comparison
+	currentMappings := make(map[int]ToolheadMapping) // spoolID -> mapping
+	printerConfigs, err := b.GetAllPrinterConfigs()
+	if err != nil {
+		log.Printf("Warning: Failed to get printer configs for location monitoring: %v", err)
+		return
+	}
+
+	// Build map of currently assigned spools in FilaBridge
+	for printerName := range printerConfigs {
+		mappings, err := b.GetToolheadMappings(printerName)
+		if err != nil {
+			log.Printf("Warning: Failed to get toolhead mappings for printer %s: %v", printerName, err)
+			continue
+		}
+		for _, mapping := range mappings {
+			currentMappings[mapping.SpoolID] = mapping
+		}
+	}
+
+	// Check each spool's location in Spoolman
+	for _, spool := range spools {
+		printerName, toolheadID, _, isToolheadLocation := b.ParseToolheadLocationName(spool.Location)
+		
+		if !isToolheadLocation {
+			// Skip non-toolhead locations, but log if a currently mapped spool was moved to storage
+			if currentMapping, isMapped := currentMappings[spool.ID]; isMapped {
+				log.Printf("Spoolman reverse sync: Spool %d moved from %s toolhead %d to storage location '%s'", 
+					spool.ID, currentMapping.PrinterName, currentMapping.ToolheadID, spool.Location)
+				// Could implement automatic unmapping here if desired
+			}
+			continue
+		}
+
+		// Find the target printer for this toolhead location
+		var targetPrinterName string
+		
+		if printerName == "" {
+			// Simple format like "Toolhead 0" - need to determine which printer
+			// For now, skip these as they're ambiguous with multiple printers
+			log.Printf("Spoolman reverse sync: Ambiguous location '%s' - need printer context for toolhead assignment", spool.Location)
+			continue
+		}
+
+		// Find printer by name (display name or ID)
+		for printerID, printerConfig := range printerConfigs {
+			if printerConfig.Name == printerName || printerID == printerName {
+				targetPrinterName = printerConfig.Name
+				break
+			}
+		}
+
+		if targetPrinterName == "" {
+			log.Printf("Spoolman reverse sync: Unknown printer '%s' in location '%s'", printerName, spool.Location)
+			continue
+		}
+
+		// Check if this spool is already assigned to this toolhead in FilaBridge
+		if currentMapping, isMapped := currentMappings[spool.ID]; isMapped {
+			if currentMapping.PrinterName == targetPrinterName && currentMapping.ToolheadID == toolheadID {
+				// Already correctly assigned, nothing to do
+				continue
+			} else {
+				log.Printf("Spoolman reverse sync: Spool %d moving from %s toolhead %d to %s toolhead %d", 
+					spool.ID, currentMapping.PrinterName, currentMapping.ToolheadID, targetPrinterName, toolheadID)
+			}
+		} else {
+			log.Printf("Spoolman reverse sync: Spool %d being assigned to %s toolhead %d from location '%s'", 
+				spool.ID, targetPrinterName, toolheadID, spool.Location)
+		}
+
+		// Perform the assignment using existing SetToolheadMapping logic
+		// Note: This will call SetToolheadMapping which will try to sync back to Spoolman
+		// but since the location is already correct in Spoolman, this should be safe
+		if err := b.SetToolheadMapping(targetPrinterName, toolheadID, spool.ID); err != nil {
+			log.Printf("Warning: Spoolman reverse sync failed to assign spool %d to %s toolhead %d: %v", 
+				spool.ID, targetPrinterName, toolheadID, err)
+		} else {
+			log.Printf("Spoolman reverse sync: Successfully assigned spool %d to %s toolhead %d", 
+				spool.ID, targetPrinterName, toolheadID)
+		}
+	}
 }
 
 // GetToolheadMappings gets all toolhead mappings for a printer

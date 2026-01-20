@@ -92,12 +92,14 @@ func main() {
 
 			// Run initial check
 			bridge.MonitorPrinters()
+			bridge.MonitorSpoolmanLocationChanges()
 
 			// Continue monitoring
 			for {
 				select {
 				case <-ticker.C:
 					bridge.MonitorPrinters()
+					bridge.MonitorSpoolmanLocationChanges()
 				case <-sigChan:
 					return
 				}
@@ -126,6 +128,7 @@ func main() {
 
 			// Run initial check
 			bridge.MonitorPrinters()
+			bridge.MonitorSpoolmanLocationChanges()
 			// Broadcast initial status
 			webServer.BroadcastStatus()
 
@@ -134,6 +137,7 @@ func main() {
 				select {
 				case <-ticker.C:
 					bridge.MonitorPrinters()
+					bridge.MonitorSpoolmanLocationChanges()
 					// Broadcast status after each monitoring cycle
 					webServer.BroadcastStatus()
 				case <-sigChan:
