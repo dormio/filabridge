@@ -135,7 +135,7 @@ function loadConfiguration() {
 
 function saveConfiguration() {
     const config = {
-        spoolman_url: document.getElementById('spoolman_url').value,
+        spoolman_url: "http://192.168.1.41:7912/",
         spoolman_username: document.getElementById('spoolman_username').value,
         spoolman_password: document.getElementById('spoolman_password').value,
         poll_interval: document.getElementById('poll_interval').value
